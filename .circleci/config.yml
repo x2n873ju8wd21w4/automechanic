@@ -1,0 +1,57 @@
+# CircleCI: единый ТИК кольца. Каждый прогон = ОДИН рандомный шаг конвейера
+# (subs/embed/delta/discover/forums) ЛИБО дневной бэкап, затем эстафета следующему
+# аккаунту через pipeline/ci_trigger.ring_handoff. Ни расписаний, ни flow —
+# вся оркестрация внутри кольца. Дистилляцию (subs -> RepairCase) делает облачный
+# Claude-агент в облаке, не CI.
+#
+# Кольцо кикается ОДИН раз (deploy.py --trigger, после замыкания всех аккаунтов) и
+# крутится, пока есть работа; встаёт, когда полный круг проходит вхолостую (RING_IDLE)
+# либо когда исчерпан месячный бюджет минут (ci_budget.guard).
+#
+# Секреты: Organization Settings -> Contexts -> 'automech' (льёт deploy.py --context):
+# ADO_*, DISTILL_*, S3_*, QDRANT_*, SUPADATA_API_KEY, YTDLP_PROXY, CRAWL_PROXY*,
+# NEXT_CIRCLECI_* + RING_SIZE (кольцо), YOUTUBE_API_KEY, BACKUP_REPO/BACKUP_GITHUB_TOKEN.
+
+version: 2.1
+
+parameters:
+  batch-size:
+    type: integer
+    default: 10
+  partition:
+    type: string
+    default: "solo"        # в кольце партиции не используются (один аккаунт за тик)
+  ring-idle:
+    type: integer
+    default: 0             # эстафетный счётчик холостых тиков (см. pipeline/ci_trigger)
+  flow:
+    type: string
+    default: "tick"        # исторический параметр триггера; в кольце игнорируется
+
+jobs:
+  tick:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: medium          # subs (tubetranscript) и forums-js поднимают Chromium
+    environment:
+      RING_IDLE: "<< pipeline.parameters.ring-idle >>"   # входящий idle кольца -> ci_trigger
+    steps:
+      - checkout
+      - run:
+          name: зависимости + Chromium (tubetranscript / forums-js)
+          command: |
+            pip install -q "yt-dlp[default,curl-cffi]" playwright -r requirements.txt
+            python -m playwright install --with-deps chromium
+      - run:
+          name: один рандомный тик конвейера -> эстафета следующему аккаунту
+          no_output_timeout: 40m
+          command: |
+            python scripts/ci_tick.py \
+              --batch << pipeline.parameters.batch-size >> \
+              --partition << pipeline.parameters.partition >>
+
+workflows:
+  ring:
+    jobs:
+      - tick:
+          context: automech

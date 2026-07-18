@@ -1,0 +1,25 @@
+.env
+keys.py
+accounts.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+*.vtt
+*.srt
+*.json3
+.pytest_cache/
+# HAR-дампы форумов: 90 МБ + содержат Cookie/сессии — только локально, в CI не нужны
+dump/
+*.har
+*_cookie.txt
+
+# build репо Claude-агента (временное)
+.claude_repo_build/
+
+# заполненный MCP-конфиг с секретами (локальный)
+.mcp_config.local.json
+
+# архивы (напр. 320МБ курс) — не в git
+*.zip
