@@ -3,16 +3,17 @@
 следующему аккаунту. Заменяет отдельные flow-воркфлоу и ADO-планировщик — вся
 оркестрация теперь внутри кольца (pipeline/ci_trigger.ring_handoff).
 
-Задачи:
-  subs     — транскрипты: state:new -> тело тикета -> state:subs
-  embed    — индексация:  state:distilled -> Qdrant -> state:indexed
-  delta    — дельта видео активных каналов -> новые Task'и state:new
-  discover — поиск НОВЫХ каналов (1-2 seed-запроса, ~минута) -> эпики
-  forums   — краул форума зоны в CI (низкий вес; основной парсинг форумов локальный)
-Плюс backup — НЕ рандом, а гард «раз/сутки»: если сегодня бэкапа не было, тик
-делает бэкап (эпики + indexed -> GitHub) и на этом завершает тик.
+Задачи (веса в пуле):
+  subs (35%)   — youtube_transcripts: state:new -> транскрипт+комменты -> state:subs
+  forums (30%) — forum_posts: краул форума -> новые посты -> state:subs
+  delta (20%)  — sync_youtube_channel_videos: активные каналы -> новые видео -> state:new
+  embed (10%)  — index_to_qdrant: state:distilled -> embedding -> Qdrant -> state:indexed
+  discover (5%) — discover_youtube_channels: seed-запросы (~1мин) -> новые каналы
+Backup — НЕ рандом, а гард «раз/сутки»: если сегодня бэкапа не было, тик
+делает бэкап (эпики + indexed -> GitHub) и завершает тик (эстафета передаётся).
 
-Дистилляцию (subs -> RepairCase) делает облачный Claude-агент, НЕ CI.
+Дистилляцию (state:subs -> RepairCase) делает облачный Claude-агент, НЕ CI.
+Кольцо: ring_handoff() передаёт эстафету следующему аккаунту GitHub.
 
 Стиринг: если в state:new пусто — subs не выбираем; если distilled пусто — embed
 не выбираем (не тратим тик впустую). worked=True сбрасывает idle кольца, worked=
@@ -43,11 +44,11 @@ def _has(ado, state: str) -> bool:
 def _choose_task(ado) -> str:
     """Взвешенный рандом со стирингом: пустые стадии обнуляются."""
     weights = {
-        "subs":     int(os.getenv("W_SUBS", "40")),
-        "embed":    int(os.getenv("W_EMBED", "25")),
-        "delta":    int(os.getenv("W_DELTA", "15")),
-        "discover": int(os.getenv("W_DISCOVER", "8")),
-        "forums":   int(os.getenv("W_FORUMS", "12")),
+        "subs":     int(os.getenv("W_SUBS", "35")),      # youtube_transcripts
+        "forums":   int(os.getenv("W_FORUMS", "30")),    # forum_posts
+        "delta":    int(os.getenv("W_DELTA", "20")),     # sync_youtube_channel_videos
+        "embed":    int(os.getenv("W_EMBED", "10")),     # index_to_qdrant
+        "discover": int(os.getenv("W_DISCOVER", "5")),   # discover_youtube_channels
     }
     if not _has(ado, "new"):
         weights["subs"] = 0            # нечего транскрибировать
@@ -69,11 +70,19 @@ def _choose_task(ado) -> str:
 def _run_task(task: str, ado, batch: int, partition: str | None) -> bool:
     """Выполнить задачу. Возвращает worked (была ли реальная работа) для idle кольца."""
     if task == "subs":
-        from ci_fetch_subs import fetch_subs_batch
-        return fetch_subs_batch(ado, batch, partition) > 0
+        from scripts.ci_fetch_subs import fetch_subs_batch
+        worked = fetch_subs_batch(ado, batch, partition) > 0
+        if not worked:
+            # subs упал (tubetranscript или другое) -> выбираем ДРУГУЮ задачу прямо сейчас
+            print(f"[tick] subs: 0 результатов, выбираю другую задачу из пула")
+            alt_tasks = ["forums", "delta", "discover", "embed"]
+            alt_task = random.choice(alt_tasks)
+            print(f"[tick] fallback: вместо subs выполняю {alt_task}")
+            return _run_task(alt_task, ado, batch, partition)
+        return worked
 
     if task == "embed":
-        from embed_index_batch import embed_batch
+        from scripts.embed_index_batch import embed_batch
         return embed_batch(ado, max(batch, 40), partition) > 0
 
     if task == "delta":
@@ -99,13 +108,8 @@ def _run_task(task: str, ado, batch: int, partition: str | None) -> bool:
 
     if task == "forums":
         from pipeline.crawler import crawl
-        # CI парсит ТОЛЬКО не-локальные форумы (рандомная зона из списка), чтобы не
-        # задваивать локальные drive2(a)/vwvortex(d)/autohome. По умолчанию:
-        #   b = bimmerforums (EN, через реле) · c = opinautos (ES) · e = carmasters (RU)
-        zones = [z.strip() for z in os.getenv("CI_FORUM_ZONES", "b,c,e").split(",")
-                 if z.strip()]
-        zone = random.choice(zones) if zones else "b"
-        t0 = time.monotonic()
+        zone = os.getenv("CI_FORUM_ZONE", "b")     # b=EN (bimmerforums) — не пересекается
+        t0 = time.monotonic()                       # с локальными drive2/vwvortex/autohome
         crawl(zone, float(os.getenv("CI_FORUM_MIN", "8")),
               create_workitems=True, max_threads=None, har=None)
         print(f"[tick] forums zone={zone}: {(time.monotonic() - t0) / 60:.1f} мин")
@@ -120,35 +124,75 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=int(os.getenv("TICK_BATCH", "10")))
     ap.add_argument("--partition", default=os.getenv("PARTITION") or None)
     ap.add_argument("--task", default=None, help="принудительная задача (иначе рандом)")
+    ap.add_argument("--run-all", action="store_true", help="выполнить ВСЕ задачи по цепочке")
     args = ap.parse_args()
     if args.partition in ("solo", ""):
         args.partition = None
 
+    print(f"[tick] ========== START ==========")
+    print(f"[tick] batch={args.batch}, partition={args.partition}, task={args.task}, run_all={args.run_all}")
+
+    print(f"[tick] проверка бюджета...")
     if not guard(20):                   # месячный лимит минут исчерпан -> пропуск,
+        print(f"[tick] бюджет исчерпан, пропуск")
         ring_handoff("tick", worked=False)   # но эстафету передаём дальше
         return
 
+    print(f"[tick] подключение к ADO...")
     ado = AdoClient()
+    print(f"[tick] ADO подключен: org={ado.org}, project={ado.project}")
 
     # 1) бэкап раз/сутки (не рандом): если сегодня не было — делаем и завершаем тик
+    print(f"[tick] проверка дневного бэкапа...")
     try:
         from pipeline.backup import run_backup
-        if run_backup(ado):
+        backup_result = run_backup(ado)
+        if backup_result:
+            print(f"[tick] бэкап выполнен успешно, тик завершён")
             ring_handoff("tick", worked=True)
             return
+        else:
+            print(f"[tick] бэкап не требуется (уже был сегодня)")
     except Exception as e:              # noqa: BLE001 — бэкап не должен рвать тик
         print(f"[tick] backup error: {str(e)[:160]}")
 
-    # 2) рандомная задача конвейера
-    task = args.task or _choose_task(ado)
-    print(f"[tick] задача: {task} (batch={args.batch}, partition={args.partition})")
+    # диагностика состояния очереди
     try:
-        worked = _run_task(task, ado, args.batch, args.partition)
-    except Exception as e:              # noqa: BLE001 — упавшая задача = пустой тик, кольцо едет
-        print(f"[tick] задача {task} упала: {str(e)[:200]}")
-        worked = False
+        new_count = len(ado.query_by_state("new", top=100) or [])
+        distilled_count = len(ado.query_by_state("distilled", top=100) or [])
+        indexed_count = len(ado.query_by_state("indexed", top=100) or [])
+        print(f"[tick] очередь: new={new_count}, distilled={distilled_count}, indexed={indexed_count}")
+    except Exception as e:
+        print(f"[tick] ошибка при запросе очереди: {str(e)[:100]}")
 
-    ring_handoff("tick", worked=worked)
+    # 2) выполнение задач
+    if args.run_all:
+        # Выполнить ВСЕ задачи по цепочке
+        tasks = ["subs", "embed", "delta", "discover", "forums"]
+        random.shuffle(tasks)  # перемешиваем порядок
+        print(f"[tick] режим run_all: выполняю {len(tasks)} задач по цепочке в порядке {tasks}")
+        total_worked = False
+        for task in tasks:
+            try:
+                worked = _run_task(task, ado, args.batch, args.partition)
+                print(f"[tick]   {task}: worked={worked}")
+                total_worked = total_worked or worked
+            except Exception as e:
+                print(f"[tick]   {task} упала: {str(e)[:100]}")
+        ring_handoff("tick", worked=total_worked)
+        print(f"[tick] ========== END (run_all, worked={total_worked}) ==========")
+    else:
+        # Рандомная или принудительная задача (оригинальное поведение)
+        task = args.task or _choose_task(ado)
+        print(f"[tick] выбранная задача: {task} (batch={args.batch}, partition={args.partition})")
+        try:
+            worked = _run_task(task, ado, args.batch, args.partition)
+            print(f"[tick] задача {task} выполнена: worked={worked}")
+        except Exception as e:              # noqa: BLE001 — упавшая задача = пустой тик, кольцо едет
+            print(f"[tick] задача {task} упала: {str(e)[:200]}")
+            worked = False
+        ring_handoff("tick", worked=worked)
+        print(f"[tick] ========== END (worked={worked}) ==========")
 
 
 if __name__ == "__main__":
